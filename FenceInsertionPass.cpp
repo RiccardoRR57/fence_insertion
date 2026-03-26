@@ -23,8 +23,9 @@ struct FenceAnalysisPass : public PassInfoMixin<FenceAnalysisPass> {
 
     FenceAnalysisPass(MemoryModel M) : Model(M) {}
 
-    // This function takes as input the state before the instruction and the intruction itself to calculate the state after
-    uint8_t simulateInstruction(Instruction &I, uint8_t CurrentState) {
+    // This function takes as input the state before the instruction and the intruction itself
+    // to calculate the state after, it also sets a flag if a violation is detected
+    uint8_t simulateInstruction(Instruction &I, uint8_t CurrentState, bool &ViolationDetected) {
         // If the instruction is a fence we need to clear the state
         if (isa<FenceInst>(&I)) {
             return PendingOp::None;
@@ -39,6 +40,7 @@ struct FenceAnalysisPass : public PassInfoMixin<FenceAnalysisPass> {
 
             // If we have a violation we simulate the insertion of a fence, we clear the state
             if (tsoViolation || psoViolation) {
+                ViolationDetected = true;
                 CurrentState = PendingOp::None;
             }
             // We found a store so we need to add a pending store to the state
@@ -50,6 +52,7 @@ struct FenceAnalysisPass : public PassInfoMixin<FenceAnalysisPass> {
             // In both cases load-load is forbidden and store-load is allowed
             // If we have a violation we simulate the insertion of a fence, we clear the state
             if (CurrentState & PendingOp::PendingRead) {
+                ViolationDetected = true;
                 CurrentState = PendingOp::None;
             }
             // We found a load so we need to add a pending load to the state
@@ -66,6 +69,7 @@ struct FenceAnalysisPass : public PassInfoMixin<FenceAnalysisPass> {
 
             // If we have a violation we simulate the insertion of a fence, we clear the state
             if (readViolation || writeViolationTSO || writeViolationPSO) {
+                ViolationDetected = true;
                 CurrentState = PendingOp::None;
             }
             // We need to add both pending load and store to the state
@@ -105,7 +109,9 @@ struct FenceAnalysisPass : public PassInfoMixin<FenceAnalysisPass> {
             // We simulate each instruction to calculate the state instruction per instruction
             uint8_t currentOut = currentIn;
             for (Instruction &I : *BB) {
-                currentOut = simulateInstruction(I, currentOut);
+                // In the analysis we don't care if there is an actual violation or not
+                bool DummyViolation = false;
+                currentOut = simulateInstruction(I, currentOut, DummyViolation);
             }
 
             // If the out set is changed we need to propagate to successors.
@@ -124,9 +130,31 @@ struct FenceAnalysisPass : public PassInfoMixin<FenceAnalysisPass> {
             outs() << "    OUT: " << stateToString(OutSets[&BB]) << "\n";
         }
 
-        // TODO insert fences
+        // Will set this to true when we change something
+        bool Changed = false;
+        for (BasicBlock &BB : F) {
+            // We get the initial state from the analysis
+            uint8_t CurrentState = InSets[&BB];
+            
+            for (auto It = BB.begin(); It != BB.end(); ) {
+                Instruction &I = *It++;
+                bool ViolationDetected = false;
 
-        return PreservedAnalyses::all();
+                // We simulate each instruction to see if we detect a violation
+                uint8_t NextState = simulateInstruction(I, CurrentState, ViolationDetected);
+                // If we have a violation we insert a fence
+                if (ViolationDetected) {
+                    outs() << "  -> Inserting SC-Fence before instruction in " << BB.getName() << "\n";
+                    IRBuilder<> Builder(&I); 
+                    Builder.CreateFence(AtomicOrdering::SequentiallyConsistent);
+                    Changed = true;
+                }
+                // Proceed with the next instruction
+                CurrentState = NextState;
+            }
+        }
+        // If we added at least a fence we need to invalidate the analysis
+        return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
 
     StringRef stateToString(uint8_t State) {
